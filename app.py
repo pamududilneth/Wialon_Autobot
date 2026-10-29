@@ -5,6 +5,8 @@ from PIL import Image, ImageTk
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.common.action_chains import ActionChains
+from selenium.common.exceptions import StaleElementReferenceException
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 import time
@@ -12,6 +14,7 @@ import os
 import re
 import shutil
 import json
+from datetime import datetime
 from pathlib import Path
 
 # keyring stores the password in Windows Credential Manager (encrypted by Windows).
@@ -28,8 +31,34 @@ DOWNLOAD_TIMEOUT = 120    # max seconds to wait for one PDF to finish downloadin
 MAX_RETRIES = 2           # how many times to retry a row if it fails
 # --------------------------------------------------------
 
-FINAL_FOLDER = Path.home() / "Downloads"          # where renamed PDFs end up
-TEMP_FOLDER = FINAL_FOLDER / "_wialon_tmp"        # Chrome downloads here first
+# These two are set again at the start of every run:
+#   FINAL_FOLDER = <folder you choose> / <run date>     (renamed PDFs + results file)
+#   TEMP_FOLDER  = FINAL_FOLDER / _tmp                  (Chrome downloads here first)
+DEFAULT_DOWNLOAD_FOLDER = Path.home() / "Downloads"
+FINAL_FOLDER = DEFAULT_DOWNLOAD_FOLDER
+TEMP_FOLDER = FINAL_FOLDER / "_tmp"
+
+SETTINGS_FILE = Path.home() / ".wialon_scraper_settings.json"   # remembers last folder
+
+
+def load_download_folder():
+    """Last folder the user picked (if it still exists), else the Downloads folder."""
+    try:
+        if SETTINGS_FILE.exists():
+            data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+            folder = data.get("download_folder", "")
+            if folder and Path(folder).is_dir():
+                return folder
+    except Exception as e:
+        print(f"Could not load folder setting: {e}")
+    return str(DEFAULT_DOWNLOAD_FOLDER)
+
+
+def save_download_folder(folder):
+    try:
+        SETTINGS_FILE.write_text(json.dumps({"download_folder": folder}), encoding="utf-8")
+    except Exception as e:
+        print(f"Could not save folder setting: {e}")
 
 
 CONFIG_FILE = Path.home() / ".wialon_scraper_config.json"   # stores username only
@@ -72,6 +101,22 @@ def clear_credentials():
             CONFIG_FILE.unlink()
     except Exception as e:
         print(f"Could not clear saved login: {e}")
+
+
+# Accepted Excel column names (case-insensitive). Old and new formats both work.
+JOB_ALIASES = ["BOOKING NO", "BOOKING NUMBER", "JOB NUMBER", "JOB NO"]
+VEHICLE_ALIASES = ["VEHICLE NO", "VEHICLE NUMBER"]
+FROM_ALIASES = ["ARRIVED AT PICKUP", "FROM"]
+TO_ALIASES = ["DEPARTURE FROM DELIVERY", "TO"]
+
+
+def find_column(df, aliases):
+    """Return the real column name in df matching any alias, or None."""
+    lookup = {str(c).strip().upper(): c for c in df.columns}
+    for alias in aliases:
+        if alias in lookup:
+            return lookup[alias]
+    return None
 
 
 def clean_value(value):
@@ -161,15 +206,143 @@ def type_into(wait, element_id, text, pause=0.5):
     box.send_keys(Keys.ENTER)
 
 
-def run_one_row(driver, wait, vehicle_number, from_date, to_date, job_number):
-    # 1. Vehicle
-    type_into(wait, "report_templates_filter_units", vehicle_number, pause=1)
+def find_suggestions(driver, box, plate):
+    """Visible elements whose text contains the plate, topmost first (below the Object box)."""
+    upper = "translate(text(),'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ')"
+    xpath = f"//*[contains({upper}, '{plate}')]"
+    found = []
+    for e in driver.find_elements(By.XPATH, xpath):
+        try:
+            if e.is_displayed():
+                found.append((e, e.location["y"]))
+        except StaleElementReferenceException:
+            pass
+    try:
+        input_y = box.location["y"]
+    except Exception:
+        input_y = 0
+    below = [item for item in found if item[1] >= input_y]
+    candidates = below or found
+    candidates.sort(key=lambda item: item[1])
+    return [item[0] for item in candidates]
 
-    # 2. From / To dates
-    if from_date:
-        type_into(wait, "time_from_report_templates_filter_time", from_date)
-    if to_date:
-        type_into(wait, "time_to_report_templates_filter_time", to_date)
+
+# Full mouse sequence for dropdowns that react to mousedown/mouseup instead of click
+JS_FULL_CLICK = """
+const el = arguments[0];
+for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+    el.dispatchEvent(new MouseEvent(type, {bubbles: true, cancelable: true, view: window}));
+}
+"""
+
+
+def select_vehicle(driver, wait, vehicle_number):
+    """
+    Type the plate (e.g. LP-1429) into the Object box, then select the first
+    suggestion (e.g. 'LP-1429 (14.5 Ft)'). Tries a real mouse click first,
+    then a full JS mouse sequence, then keyboard (Down + Enter), and checks
+    after each that the suggestion list closed.
+    """
+    plate = vehicle_number.strip().upper()
+
+    box = wait.until(EC.element_to_be_clickable((By.ID, "report_templates_filter_units")))
+    box.click()
+    box.send_keys(Keys.CONTROL + "a")
+    box.send_keys(Keys.BACKSPACE)
+    time.sleep(1)
+    box.send_keys(plate)
+    time.sleep(1.5)   # let the list filter
+
+    # Wait for the first suggestion to appear
+    option = None
+    end_time = time.time() + 10
+    while time.time() < end_time:
+        candidates = find_suggestions(driver, box, plate)
+        if candidates:
+            option = candidates[0]
+            break
+        time.sleep(0.5)
+
+    def keyboard_select():
+        box.send_keys(Keys.ARROW_DOWN)
+        time.sleep(0.5)
+        box.send_keys(Keys.ENTER)
+
+    if option is None:
+        print(f"No suggestion found by text for {plate}, trying keyboard")
+        keyboard_select()
+        time.sleep(1)
+        return
+
+    try:
+        print(f"Suggestion found: {option.text!r}")
+    except Exception:
+        pass
+
+    def suggestion_closed():
+        try:
+            return not option.is_displayed()
+        except StaleElementReferenceException:
+            return True
+
+    strategies = [
+        ("mouse click", lambda: ActionChains(driver).move_to_element(option).pause(0.3).click().perform()),
+        ("js mouse events", lambda: driver.execute_script(JS_FULL_CLICK, option)),
+        ("keyboard", keyboard_select),
+    ]
+
+    for name, action in strategies:
+        try:
+            action()
+        except Exception as e:
+            print(f"{name} failed: {e}")
+        time.sleep(1)
+        if suggestion_closed():
+            print(f"Vehicle {plate} selected using {name}")
+            return
+
+    try:
+        print("Suggestion HTML:", option.get_attribute("outerHTML")[:300])
+    except Exception:
+        pass
+    raise ValueError(f"Could not select vehicle '{vehicle_number}' from the suggestion list")
+
+
+def set_datetime(wait, element_id, text):
+    """Type a date/time, commit it (Enter + Tab) and check it was accepted."""
+    for attempt in range(2):
+        box = wait.until(EC.element_to_be_clickable((By.ID, element_id)))
+        box.click()
+        box.send_keys(Keys.CONTROL + "a")
+        box.send_keys(Keys.BACKSPACE)
+        time.sleep(0.5)
+        box.send_keys(text)
+        box.send_keys(Keys.ENTER)
+        box.send_keys(Keys.TAB)     # moving focus away makes Wialon accept the value
+        time.sleep(0.8)
+        value = (box.get_attribute("value") or "").strip()
+        if value and text[:4] in value:
+            return
+    print(f"Warning: '{text}' may not have been accepted in {element_id}")
+
+
+def run_one_row(driver, wait, vehicle_number, from_date, to_date, job_number, time_btn_id):
+    # 1. Vehicle (select the matching '<name> (<plate>)' item)
+    select_vehicle(driver, wait, vehicle_number)
+
+    # 2. Interval: custom From/To from Excel, otherwise the chosen preset button
+    if from_date and to_date:
+        set_datetime(wait, "time_from_report_templates_filter_time", from_date)
+        set_datetime(wait, "time_to_report_templates_filter_time", to_date)
+    else:
+        if from_date:
+            set_datetime(wait, "time_from_report_templates_filter_time", from_date)
+        if to_date:
+            set_datetime(wait, "time_to_report_templates_filter_time", to_date)
+        if not from_date and not to_date:
+            time_btn = wait.until(EC.element_to_be_clickable((By.ID, time_btn_id)))
+            time_btn.click()   # avoids the 'no interval selected' warning
+            time.sleep(1)
 
     # 3. Make sure the temp folder is empty so we only catch THIS download
     clear_temp_folder()
@@ -195,13 +368,35 @@ def run_one_row(driver, wait, vehicle_number, from_date, to_date, job_number):
     return final_path.name
 
 
-def process_data(file_path, username, password, template_name, time_frame):
+def process_data(file_path, username, password, template_name, time_frame, download_folder):
+    global FINAL_FOLDER, TEMP_FOLDER
     driver = None
     try:
-        # Read Job/Vehicle as text so numbers like 1001 don't become 1001.0
-        df = pd.read_excel(file_path, dtype={"Job Number": str, "Vehicle Number": str})
+        # Read everything as text so numbers/dates are not changed by pandas
+        df = pd.read_excel(file_path, dtype=str)
+        df.columns = [str(c).strip() for c in df.columns]
 
+        job_col = find_column(df, JOB_ALIASES)
+        vehicle_col = find_column(df, VEHICLE_ALIASES)
+        from_col = find_column(df, FROM_ALIASES)
+        to_col = find_column(df, TO_ALIASES)
+
+        if not job_col or not vehicle_col:
+            raise ValueError(
+                "Could not find the required columns.\n"
+                "Need: BOOKING NO, VEHICLE NO (plus ARRIVED AT PICKUP and "
+                "DEPARTURE FROM DELIVERY).\n"
+                f"Found: {', '.join(df.columns)}"
+            )
+        if not from_col or not to_col:
+            print("Warning: date columns not found - the report will use the selected time frame only.")
+
+        # New sub-folder named with today's date inside the folder the user chose
+        run_time = datetime.now()
+        FINAL_FOLDER = Path(download_folder) / run_time.strftime("%Y-%m-%d")
+        TEMP_FOLDER = FINAL_FOLDER / "_tmp"
         TEMP_FOLDER.mkdir(parents=True, exist_ok=True)
+        print(f"Saving PDFs to: {FINAL_FOLDER}")
 
         options = webdriver.ChromeOptions()
         prefs = {
@@ -261,19 +456,19 @@ def process_data(file_path, username, password, template_name, time_frame):
         results = []
 
         for index, row in df.iterrows():
-            job_number = clean_value(row.get("Job Number", ""))
-            vehicle_number = clean_value(row.get("Vehicle Number", ""))
+            job_number = clean_value(row[job_col])
+            vehicle_number = clean_value(row[vehicle_col])
 
             if not job_number or not vehicle_number:
                 results.append("Skipped: Missing data")
                 continue
 
             # Automatic date conversion: '10/21/2026 0:00' -> '2026 October 21 00:00'
-            raw_from = row.get("From", "")
-            raw_to = row.get("To", "")
+            raw_from = row[from_col] if from_col else ""
+            raw_to = row[to_col] if to_col else ""
             try:
-                from_date = pd.to_datetime(raw_from).strftime("%Y %B %d %H:%M") if pd.notnull(raw_from) else ""
-                to_date = pd.to_datetime(raw_to).strftime("%Y %B %d %H:%M") if pd.notnull(raw_to) else ""
+                from_date = pd.to_datetime(raw_from).strftime("%Y %B %d %H:%M") if pd.notnull(raw_from) and str(raw_from).strip() else ""
+                to_date = pd.to_datetime(raw_to).strftime("%Y %B %d %H:%M") if pd.notnull(raw_to) and str(raw_to).strip() else ""
             except Exception:
                 from_date = clean_value(raw_from)
                 to_date = clean_value(raw_to)
@@ -281,13 +476,20 @@ def process_data(file_path, username, password, template_name, time_frame):
             status = None
             for attempt in range(1, MAX_RETRIES + 1):
                 try:
-                    name = run_one_row(driver, wait, vehicle_number, from_date, to_date, job_number)
+                    name = run_one_row(driver, wait, vehicle_number, from_date, to_date, job_number, time_btn_id)
                     status = f"Success: {name}"
                     print(status)
                     break
                 except Exception as loop_error:
                     status = f"Failed on {job_number}: {str(loop_error)}"
                     print(f"Attempt {attempt} failed for {job_number}: {loop_error}")
+                    # Save a screenshot so you can see what Wialon showed
+                    try:
+                        err_dir = FINAL_FOLDER / "wialon_errors"
+                        err_dir.mkdir(parents=True, exist_ok=True)
+                        driver.save_screenshot(str(err_dir / f"{safe_filename(job_number)}_attempt{attempt}.png"))
+                    except Exception:
+                        pass
                     time.sleep(3)
 
             results.append(status)
@@ -311,9 +513,13 @@ def process_data(file_path, username, password, template_name, time_frame):
             pass
 
         df["Status"] = results
-        output_filename = os.path.join(os.path.dirname(file_path), "Scraped_Results.xlsx")
+        # One results file per run (date + time in the name, so runs never overwrite each other)
+        output_filename = FINAL_FOLDER / f"Scraped_Results_{run_time.strftime('%Y-%m-%d_%H-%M-%S')}.xlsx"
         df.to_excel(output_filename, index=False)
-        messagebox.showinfo("Success", f"Process complete! Status saved to {output_filename}")
+        messagebox.showinfo(
+            "Success",
+            f"Process complete!\n\nPDFs and results saved in:\n{FINAL_FOLDER}\n\nResults file: {output_filename.name}"
+        )
 
     except Exception as e:
         messagebox.showerror("Error", f"A fatal error occurred: {str(e)}")
@@ -323,6 +529,15 @@ def process_data(file_path, username, password, template_name, time_frame):
                 driver.quit()
             except Exception:
                 pass
+
+
+def browse_folder():
+    folder = filedialog.askdirectory(
+        title="Select folder to save PDFs",
+        initialdir=folder_var.get() or str(DEFAULT_DOWNLOAD_FOLDER)
+    )
+    if folder:
+        folder_var.set(os.path.normpath(folder))
 
 
 def start_process():
@@ -346,18 +561,24 @@ def start_process():
     else:
         clear_credentials()
 
+    download_folder = folder_var.get().strip()
+    if not download_folder or not os.path.isdir(download_folder):
+        messagebox.showwarning("Warning", "Please select a valid download folder.")
+        return
+    save_download_folder(download_folder)
+
     file_path = filedialog.askopenfilename(
         title="Select Excel File",
         filetypes=[("Excel files", "*.xlsx *.xls")]
     )
     if file_path:
         root.update()
-        process_data(file_path, username, password, template_name, time_frame)
+        process_data(file_path, username, password, template_name, time_frame, download_folder)
 
 
 root = tk.Tk()
 root.title("Auto Web Scraper Pro")
-root.geometry("450x520")
+root.geometry("450x620")
 root.configure(bg="#f3f4f6")
 
 style = ttk.Style()
@@ -427,7 +648,17 @@ ttk.Label(frame, text="Select Time Frame").pack(anchor="w", pady=(0, 4))
 time_combo = ttk.Combobox(frame, state="readonly")
 time_combo["values"] = ["Today", "Yesterday", "Week", "Month"]
 time_combo.current(0)
-time_combo.pack(fill="x", pady=(0, 25))
+time_combo.pack(fill="x", pady=(0, 15))
+
+# Download folder selector
+ttk.Label(frame, text="Download Folder").pack(anchor="w", pady=(0, 4))
+folder_row = tk.Frame(frame, bg="#f3f4f6")
+folder_row.pack(fill="x", pady=(0, 20))
+folder_var = tk.StringVar(value=load_download_folder())
+folder_entry = ttk.Entry(folder_row, textvariable=folder_var, state="readonly")
+folder_entry.pack(side="left", fill="x", expand=True)
+browse_btn = ttk.Button(folder_row, text="Browse", command=browse_folder)
+browse_btn.pack(side="left", padx=(8, 0))
 
 upload_btn = ttk.Button(frame, text="Upload Excel & Run", command=start_process)
 upload_btn.pack(fill="x", pady=(10, 20))
